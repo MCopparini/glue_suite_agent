@@ -1,0 +1,32 @@
+{
+  "name": "gs-agent",
+  "version": "0.1.0",
+  "description": "GlueSuite agent: collega i sistemi del cliente (3CAD, SAP...) all'integration hub",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "gs-agent": "./dist/cli.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/cli.js run",
+    "dev": "tsc -p tsconfig.json && node dist/cli.js",
+    "test": "npm run build && node --test \"dist/**/*.test.js\""
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MCopparini/glue_suite_agent.git"
+  },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@mcopparini/gs-contracts": "github:MCopparini/glue_suite_contracts#v0.1.0",
+    "amqplib": "2.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.1",
+    "typescript": "6.0.2"
+  }
+}
