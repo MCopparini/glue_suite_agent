@@ -1,4 +1,4 @@
-import type { GsEnvelope, RecordResultPayload } from '@mcopparini/gs-contracts';
+import type { GsEnvelope, RecordResultPayload, SyncMode } from '@mcopparini/gs-contracts';
 
 // Interfaccia di un modulo connettore. Il modulo fa solo il trasporto verso il proprio sistema
 // (leggere, scrivere, convertire XML/paginazione...): NON traduce verso il modello canonico,
@@ -17,6 +17,7 @@ export interface ModuleContext {
     config: Record<string, any>;   // configurazione con i segreti gia' risolti (solo in memoria)
     log: ModuleLogger;
     // Invia all'hub un dato nativo; externalId = codice del dato nel sistema collegato.
+    // Quando la promessa si risolve il dato e' al sicuro su disco: verra' consegnato anche se il broker ora non c'e'.
     emit(messageType: string, payload: unknown, externalId?: string): Promise<void>;
 }
 
@@ -26,6 +27,9 @@ export interface ConnectorModule {
     stop(): Promise<void>;
     // Dato in arrivo dall'hub (gia' nel formato nativo): esito e codice usato nel sistema.
     handle(env: GsEnvelope): Promise<RecordResultPayload>;
+    // Lettura dal sistema collegato (solo i moduli che importano dati): delta = novita', full = tutto.
+    // Pianificata con "schedule" (cron) nella configurazione del connettore, oppure su richiesta.
+    sync?(mode: SyncMode): Promise<{ count: number }>;
 }
 
 export type ModuleFactory = (ctx: ModuleContext) => ConnectorModule;

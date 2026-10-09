@@ -46,6 +46,20 @@ Administrators e LocalService. Da PowerShell come amministratore:
 
 Entrambi gli script si possono rilanciare per aggiornare il codice: l'attivazione resta.
 
+## Sincronizzazione dai sistemi collegati
+
+I moduli che leggono da un sistema (es. l'import notturno degli articoli da SAP) si pianificano con
+`schedule` nella configurazione del connettore, in formato cron a 5 campi e ora locale della macchina
+(`"0 2 * * *"` = tutte le notti alle 2). Da GlueSuite si può anche lanciare **sincronizza ora**
+(`delta`, solo le novità) o **rileggi tutto** (`full`): `POST /integration/connectors/:id/sync`.
+Ultima e prossima esecuzione, esito e dati in attesa si vedono nel runtime del connettore.
+
+**Nessun dato letto va perso.** Ogni dato letto viene salvato su disco (`spool/`) prima di essere inviato
+e cancellato solo quando il broker l'ha preso in carico. Se il broker o la rete non rispondono, i dati
+restano su disco e partono appena possibile, nello stesso ordine e con lo stesso identificativo
+(l'hub scarta eventuali doppioni). Importante per i sistemi che considerano un dato consegnato appena
+letto, come i change pointer di SAP.
+
 ## Cosa resta sulla macchina
 
 | File | Contenuto |

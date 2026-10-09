@@ -22,7 +22,7 @@
   },
   "license": "UNLICENSED",
   "dependencies": {
-    "@mcopparini/gs-contracts": "github:MCopparini/glue_suite_contracts#v0.2.0",
+    "@mcopparini/gs-contracts": "github:MCopparini/glue_suite_contracts#v0.3.0",
     "amqplib": "2.0.1"
   },
   "devDependencies": {
