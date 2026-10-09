@@ -1,20 +1,25 @@
 import amqplib from 'amqplib';
 import type { Channel, ChannelModel, ConfirmChannel, ConsumeMessage, RecoveringChannelModel } from 'amqplib';
 import {
-    AGENT_SYSTEM, EXCHANGES, MESSAGE_TYPES, agentControlQueue, collectSecretRefs, createEnvelope, createReply,
-    ingressRoutingKey, parseEnvelope,
+    AGENT_SYSTEM, EXCHANGES, MESSAGE_TYPES, agentControlQueue, collectSecretRefs, connectorQueue, createEnvelope,
+    createReply, ingressRoutingKey, parseEnvelope, resolveSecretRefs, resultType,
     type CommandResultPayload, type ConnectorConfigPayload, type ConnectorReport, type ConnectorRuntimeState,
     type ConnectorSetSecretPayload, type GsEnvelope, type HeartbeatPayload, type LogLevel, type LogLine,
-    type LogsStreamPayload, type LogsTailPayload, type SetLogLevelPayload
+    type LogsStreamPayload, type LogsTailPayload, type RecordResultPayload, type SetLogLevelPayload
 } from '@mcopparini/gs-contracts';
+import { MODULES, type ConnectorModule } from './modules/index.js';
 import { AgentStore, type AgentIdentity } from './store.js';
 import { AGENT_VERSION } from './version.js';
 import { log } from './logger.js';
 
 // Runtime dell'agente: connessione al broker con le proprie credenziali, comandi dalla coda
-// agent.<code>, heartbeat periodico verso l'hub.
-// I moduli dei connettori (3cad, sap...) non ci sono ancora: un connettore abilitato risulta
-// in errore "modulo non disponibile" finche' il modulo non viene installato.
+// agent.<code>, heartbeat periodico verso l'hub, moduli dei connettori.
+// Ogni connettore segue lo stato voluto inviato dall'hub (connector.config):
+//   enabled   modulo avviato con la configurazione (segreti risolti dall'archivio locale)
+//             e consumo della coda dati conn.<id>
+//   paused    modulo fermo e coda non consumata: i dati restano in coda
+//   disabled  modulo fermo
+// Un tipo senza modulo in questa versione dell'agente risulta in errore.
 
 interface ConnectorState {
     config: ConnectorConfigPayload | null;
@@ -22,6 +27,11 @@ interface ConnectorState {
     processed: number;
     failed: number;
     lastError?: string;
+    state: ConnectorRuntimeState;
+    module?: ConnectorModule;
+    runningVersion?: number;
+    dataChannel?: Channel;
+    queue?: Promise<void>;   // le riconciliazioni di un connettore sono in serie
 }
 
 type PersistedState = Record<string, { config: ConnectorConfigPayload | null; desired: ConnectorState['desired'] }>;
@@ -43,7 +53,7 @@ export class AgentRuntime {
         this.identity = store.identity();
         const saved = store.loadState<PersistedState>({});
         for (const [id, s] of Object.entries(saved)) {
-            this.connectors.set(id, { config: s.config, desired: s.desired, processed: 0, failed: 0 });
+            this.connectors.set(id, { config: s.config, desired: s.desired, processed: 0, failed: 0, state: 'stopped' });
         }
     }
 
@@ -67,6 +77,9 @@ export class AgentRuntime {
         this.model.on('connect', () => log.info('collegato al broker'));
         this.model.on('error', err => log.error(`errore broker: ${err.message}`));
 
+        // riparte con le ultime configurazioni ricevute, senza attendere l'hub
+        for (const id of this.connectors.keys()) await this.reconcile(id);
+
         const intervalMs = Math.max(5, this.identity.heartbeatIntervalSec) * 1000;
         this.heartbeatTimer = setInterval(() => void this.sendHeartbeat(), intervalMs);
         await this.sendHeartbeat();
@@ -86,7 +99,151 @@ export class AgentRuntime {
         await ch.consume(agentControlQueue(this.identity.agentCode), msg => {
             if (msg) void this.onControl(ch, msg);
         });
+
+        // dopo una riconnessione i canali dati sono chiusi: si riaprono per i connettori in esecuzione
+        for (const [id, s] of this.connectors) {
+            if (s.module) {
+                s.dataChannel = undefined;
+                await this.startData(model, id, s).catch(err => log.error(`coda dati non riaperta: ${(err as Error).message}`, id));
+            }
+        }
     }
+
+    //#region moduli dei connettori
+
+    private reconcile(id: string): Promise<void> {
+        const s = this.connector(id);
+        const next = (s.queue ?? Promise.resolve()).then(() => this.doReconcile(id, s)).catch(err => {
+            s.state = 'error';
+            s.lastError = (err as Error).message;
+            log.error(`riconciliazione fallita: ${s.lastError}`, id);
+        });
+        s.queue = next;
+        return next;
+    }
+
+    private async doReconcile(id: string, s: ConnectorState) {
+        const cfg = s.config;
+        const want = s.desired === 'enabled' && !!cfg && cfg.configVersion > 0;
+        if (want && s.module && s.runningVersion === cfg!.configVersion) {
+            if (!s.dataChannel && this.model) await this.startData(this.model, id, s);
+            return;
+        }
+
+        await this.stopModule(id, s);
+        if (!want) {
+            s.state = s.desired === 'paused' ? 'paused' : 'stopped';
+            s.lastError = undefined;
+            return;
+        }
+
+        const factory = MODULES[cfg!.typeCode];
+        if (!factory) {
+            s.state = 'error';
+            s.lastError = `modulo "${cfg!.typeCode}" non disponibile in questa versione dell'agente`;
+            return;
+        }
+        try {
+            s.state = 'starting';
+            const config = resolveSecretRefs(cfg!.config, ref => this.store.getSecret(id, ref));
+            const module = factory({
+                connectorId: id,
+                typeCode: cfg!.typeCode,
+                config,
+                log: {
+                    error: m => log.error(m, id), warn: m => log.warn(m, id),
+                    info: m => log.info(m, id), debug: m => log.debug(m, id),
+                },
+                emit: (type, payload, externalId) => this.emitData(id, cfg!.typeCode, type, payload, externalId),
+            });
+            await module.start();
+            s.module = module;
+            s.runningVersion = cfg!.configVersion;
+            if (this.model) await this.startData(this.model, id, s);
+            s.state = 'running';
+            s.lastError = undefined;
+            log.info(`modulo ${cfg!.typeCode} ${module.version} avviato (configurazione v${cfg!.configVersion})`, id);
+        } catch (err) {
+            await this.stopModule(id, s);
+            s.state = 'error';
+            s.lastError = (err as Error).message;
+            log.error(`avvio del modulo fallito: ${s.lastError}`, id);
+        }
+    }
+
+    private async stopModule(id: string, s: ConnectorState) {
+        const ch = s.dataChannel;
+        s.dataChannel = undefined;
+        await ch?.close().catch(() => {});   // i messaggi non confermati tornano in coda
+        const module = s.module;
+        s.module = undefined;
+        s.runningVersion = undefined;
+        if (module) {
+            await module.stop().catch(err => log.warn(`arresto del modulo: ${(err as Error).message}`, id));
+            log.info('modulo fermato', id);
+        }
+    }
+
+    // Coda dati del connettore (conn.<id>): dati in arrivo dall'hub, gia' nel formato nativo.
+    private async startData(source: Pick<ChannelModel, 'createChannel'>, id: string, s: ConnectorState) {
+        const ch = await source.createChannel();
+        ch.on('error', err => log.error(`canale dati: ${err.message}`, id));
+        ch.on('close', () => { if (s.dataChannel === ch) s.dataChannel = undefined; });
+        await ch.prefetch(5);
+        await ch.consume(connectorQueue(id), msg => {
+            if (msg) void this.onData(ch, id, s, msg);
+        });
+        s.dataChannel = ch;
+    }
+
+    private async onData(ch: Channel, id: string, s: ConnectorState, msg: ConsumeMessage) {
+        let env: GsEnvelope;
+        try {
+            env = parseEnvelope(msg.content);
+            if (env.domainId !== this.identity.domainId || env.target?.connectorId !== id) throw new Error('dato non destinato a questo connettore');
+        } catch (err) {
+            log.error(`dato scartato: ${(err as Error).message}`, id);
+            ch.nack(msg, false, false);
+            return;
+        }
+        const module = s.module;
+        if (!module) {
+            ch.nack(msg, false, true);   // modulo in arresto: il dato torna in coda
+            return;
+        }
+
+        let result: RecordResultPayload;
+        try {
+            result = await module.handle(env);
+            if (result.ok) s.processed++; else s.failed++;
+        } catch (err) {
+            result = { ok: false, error: (err as Error).message };
+            s.failed++;
+            log.warn(`${env.type} non elaborato: ${result.error}`, id);
+        }
+        try {
+            await this.publish(createReply(env, {
+                type: resultType(env.type), schemaVersion: 1,
+                source: { system: s.config!.typeCode, connectorId: id },
+                payloadFormat: 'canonical', payload: result
+            }));
+            ch.ack(msg);
+        } catch (err) {
+            log.error(`esito di ${env.type} non inviato: ${(err as Error).message}`, id);
+            ch.nack(msg, false, true);
+        }
+    }
+
+    // Dato nativo verso l'hub (gs.ingress), a nome del connettore.
+    private async emitData(id: string, typeCode: string, type: string, payload: unknown, externalId?: string) {
+        await this.publish(createEnvelope({
+            kind: 'event', type, schemaVersion: 1, domainId: this.identity.domainId,
+            source: { system: typeCode, connectorId: id, ...(externalId ? { externalId: String(externalId).slice(0, 200) } : {}) },
+            payloadFormat: `native:${typeCode}`, payload
+        }));
+    }
+
+    //#endregion
 
     private async publish(env: GsEnvelope) {
         const ch = this.pub;
@@ -156,21 +313,14 @@ export class AgentRuntime {
     private connectorReport(connectorId: string, s: ConnectorState): ConnectorReport {
         const refs = s.config ? collectSecretRefs(s.config.config) : [];
         const secrets = this.store.secretReports(connectorId, refs);
-        let state: ConnectorRuntimeState = 'stopped';
-        let lastError = s.lastError;
-        if (s.desired === 'paused') state = 'paused';
-        if (s.desired === 'enabled') {
-            state = 'error';
-            lastError = `modulo "${s.config?.typeCode ?? '?'}" non disponibile in questa versione dell'agente`;
-        }
         return {
             connectorId,
-            state,
+            state: s.state,
             configVersion: s.config?.configVersion ?? null,
-            moduleVersion: null,
+            moduleVersion: s.module?.version ?? null,
             processed: s.processed,
             failed: s.failed,
-            ...(lastError ? { lastError } : {}),
+            ...(s.lastError ? { lastError: s.lastError } : {}),
             secrets
         };
     }
@@ -229,7 +379,7 @@ export class AgentRuntime {
         if (!connectorId) throw new Error('connectorId mancante');
         let s = this.connectors.get(connectorId);
         if (!s) {
-            s = { config: null, desired: 'disabled', processed: 0, failed: 0 };
+            s = { config: null, desired: 'disabled', processed: 0, failed: 0, state: 'stopped' };
             this.connectors.set(connectorId, s);
         }
         return s;
@@ -251,7 +401,8 @@ export class AgentRuntime {
                 s.desired = cfg.desiredState;
                 this.persist();
                 log.info(`configurazione v${cfg.configVersion} ricevuta (stato voluto: ${cfg.desiredState})`, cfg.connectorId);
-                return { configVersion: cfg.configVersion };
+                await this.reconcile(cfg.connectorId);
+                return { configVersion: cfg.configVersion, state: s.state };
             }
             case MESSAGE_TYPES.connectorStart:
             case MESSAGE_TYPES.connectorPause:
@@ -260,13 +411,17 @@ export class AgentRuntime {
                 s.desired = env.type === MESSAGE_TYPES.connectorStart ? 'enabled' : env.type === MESSAGE_TYPES.connectorPause ? 'paused' : 'disabled';
                 this.persist();
                 log.info(`stato voluto: ${s.desired}`, p.connectorId);
-                return { desired: s.desired };
+                await this.reconcile(p.connectorId);
+                return { desired: s.desired, state: s.state };
             }
             case MESSAGE_TYPES.connectorSetSecret: {
                 const sec = p as ConnectorSetSecretPayload;
-                this.connector(sec.connectorId);
+                const s = this.connector(sec.connectorId);
                 this.store.setSecret(sec.connectorId, sec.ref, sec.sealed);
                 log.info(`segreto "${sec.ref}" aggiornato`, sec.connectorId);
+                // il modulo in esecuzione riparte con il segreto nuovo (o parte, se mancava)
+                s.runningVersion = undefined;
+                void this.reconcile(sec.connectorId);
                 return { ref: sec.ref };
             }
             case MESSAGE_TYPES.logsTail: {
@@ -292,6 +447,7 @@ export class AgentRuntime {
         this.stopping = true;
         if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
         this.logStream?.stop();
+        for (const [id, s] of this.connectors) await this.stopModule(id, s);
         await this.model?.close().catch(() => {});
         log.info('agente fermato');
     }
