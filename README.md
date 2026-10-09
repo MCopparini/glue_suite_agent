@@ -26,6 +26,26 @@ node dist/cli.js status
 Opzione comune `--data-dir <cartella>` (oppure `GS_AGENT_DATA_DIR`). Default:
 Windows `%ProgramData%\GlueSuite\agent`, Linux `/var/lib/gs-agent` (root) o `~/.gs-agent`.
 
+## Installazione come servizio
+
+**Linux (systemd)** - utente dedicato `gs-agent`, codice in `/opt/gs-agent`, dati in `/var/lib/gs-agent`,
+unità con le protezioni di systemd (l'agente scrive solo nella sua cartella dati):
+
+```bash
+sudo bash install/linux/install.sh --hub https://<hub> --token gsat_...
+journalctl -u gs-agent -f
+```
+
+**Windows** - servizio tramite [WinSW](https://github.com/winsw/winsw) (scaricare `WinSW-x64.exe` dalla release
+ufficiale), account `LocalService`, dati in `%ProgramData%\GlueSuite\agent` accessibili solo a SYSTEM,
+Administrators e LocalService. Da PowerShell come amministratore:
+
+```powershell
+.\install\windows\install.ps1 -WinSWPath C:\Downloads\WinSW-x64.exe -Hub https://<hub> -Token gsat_...
+```
+
+Entrambi gli script si possono rilanciare per aggiornare il codice: l'attivazione resta.
+
 ## Cosa resta sulla macchina
 
 | File | Contenuto |

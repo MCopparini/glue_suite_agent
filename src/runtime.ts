@@ -4,8 +4,8 @@ import {
     AGENT_SYSTEM, EXCHANGES, MESSAGE_TYPES, agentControlQueue, collectSecretRefs, createEnvelope, createReply,
     ingressRoutingKey, parseEnvelope,
     type CommandResultPayload, type ConnectorConfigPayload, type ConnectorReport, type ConnectorRuntimeState,
-    type ConnectorSetSecretPayload, type GsEnvelope, type HeartbeatPayload, type LogLevel, type LogsTailPayload,
-    type SetLogLevelPayload
+    type ConnectorSetSecretPayload, type GsEnvelope, type HeartbeatPayload, type LogLevel, type LogLine,
+    type LogsStreamPayload, type LogsTailPayload, type SetLogLevelPayload
 } from '@mcopparini/gs-contracts';
 import { AgentStore, type AgentIdentity } from './store.js';
 import { AGENT_VERSION } from './version.js';
@@ -27,6 +27,7 @@ interface ConnectorState {
 type PersistedState = Record<string, { config: ConnectorConfigPayload | null; desired: ConnectorState['desired'] }>;
 
 const LOG_LEVELS: LogLevel[] = ['error', 'warn', 'info', 'debug'];
+const MAX_STREAM_SEC = 900;
 
 export class AgentRuntime {
     private readonly identity: AgentIdentity;
@@ -36,6 +37,7 @@ export class AgentRuntime {
     private heartbeatTimer?: NodeJS.Timeout;
     private readonly startedAt = new Date();
     private stopping = false;
+    private logStream?: { stop: () => void };
 
     constructor(private readonly store: AgentStore) {
         this.identity = store.identity();
@@ -102,6 +104,42 @@ export class AgentRuntime {
                 userId: this.identity.broker.username,
             }, err => err ? reject(err instanceof Error ? err : new Error(String(err))) : resolve());
         });
+    }
+
+    // Log live su gs.logs: messaggi non persistenti, senza conferma; se il broker non c'e' si perdono.
+    private publishLog(line: LogLine) {
+        const ch = this.pub;
+        if (!ch) return;
+        const env = createEnvelope({ ...this.envelopeBase(), kind: 'event', type: 'agent.log', payload: line });
+        try {
+            ch.publish(EXCHANGES.logs, `${this.identity.agentCode}.${line.connectorId ?? 'agent'}`, Buffer.from(JSON.stringify(env)), {
+                persistent: false, contentType: 'application/json', messageId: env.id, type: env.type,
+                appId: 'gs-agent', userId: this.identity.broker.username,
+            });
+        } catch { /* canale chiuso: la riga si perde (e non la si logga, per non creare un ciclo) */ }
+    }
+
+    private startLogStream(p: LogsStreamPayload) {
+        const durationSec = Math.min(Math.max(Number(p?.durationSec) || 300, 10), MAX_STREAM_SEC);
+        const minLevel = LOG_LEVELS.indexOf(p?.level ?? 'debug');
+        if (minLevel < 0) throw new Error(`livello non valido: ${p?.level}`);
+        this.logStream?.stop();   // un nuovo stream sostituisce il precedente
+
+        const off = log.onLine(line => {
+            if (LOG_LEVELS.indexOf(line.level) > minLevel) return;
+            if (p?.connectorId && line.connectorId !== p.connectorId) return;
+            this.publishLog(line);
+        });
+        const timer = setTimeout(() => stop(), durationSec * 1000);
+        const stop = () => {
+            off();
+            clearTimeout(timer);
+            if (this.logStream === handle) this.logStream = undefined;
+        };
+        const handle = { stop };
+        this.logStream = handle;
+        log.info(`log live attivi per ${durationSec}s${p?.connectorId ? ` (connettore ${p.connectorId})` : ''}`);
+        return { durationSec, until: new Date(Date.now() + durationSec * 1000).toISOString() };
     }
 
     private envelopeBase() {
@@ -235,6 +273,8 @@ export class AgentRuntime {
                 const t = p as LogsTailPayload;
                 return { lines: log.tail(Number(t?.lines) || 200, t?.connectorId) };
             }
+            case MESSAGE_TYPES.logsStream:
+                return this.startLogStream(p as LogsStreamPayload);
             case MESSAGE_TYPES.setLogLevel: {
                 const l = p as SetLogLevelPayload;
                 if (!LOG_LEVELS.includes(l?.level)) throw new Error(`livello non valido: ${l?.level}`);
@@ -251,6 +291,7 @@ export class AgentRuntime {
     async stop() {
         this.stopping = true;
         if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+        this.logStream?.stop();
         await this.model?.close().catch(() => {});
         log.info('agente fermato');
     }
